@@ -1,0 +1,76 @@
+name: Create student repository
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: create-repo
+  cancel-in-progress: false
+
+jobs:
+  create:
+    if: contains(github.event.issue.labels.*.name, 'repo-request')
+    runs-on: ubuntu-latest
+    env:
+      ORG: ${{ github.repository_owner }}
+      LOGIN: ${{ github.event.issue.user.login }}
+      ISSUE: ${{ github.event.issue.number }}
+      BODY: ${{ github.event.issue.body }}
+      # Необязательно: имя шаблонного репозитория (переменная TEMPLATE_REPO в Settings → Variables)
+      TEMPLATE_REPO: ${{ vars.TEMPLATE_REPO }}
+      # Права студента в его репозитории: pull | triage | push | maintain | admin
+      STUDENT_PERMISSION: ${{ vars.STUDENT_PERMISSION || 'maintain' }}
+    steps:
+      - name: Create repo and invite student
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="project-${LOGIN,,}"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+
+          # ФИО из формы (строка после заголовка "### ФИО и группа")
+          NAME=$(printf '%s\n' "$BODY" | tr -d '\r' | awk '/^### /{f=0} f&&NF{print; exit} /^### ФИО и группа/{f=1}')
+
+          if gh repo view "$ORG/$REPO" >/dev/null 2>&1; then
+            echo "status=exists" >> "$GITHUB_OUTPUT"
+          else
+            if [ -n "$TEMPLATE_REPO" ]; then
+              gh repo create "$ORG/$REPO" --private --template "$ORG/$TEMPLATE_REPO" --description "$NAME"
+            else
+              gh repo create "$ORG/$REPO" --private --add-readme --description "$NAME"
+            fi
+            echo "status=created" >> "$GITHUB_OUTPUT"
+          fi
+
+          gh api -X PUT "repos/$ORG/$REPO/collaborators/$LOGIN" -f permission="$STUDENT_PERMISSION" >/dev/null
+
+      - name: Reply and close issue (success)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ steps.create.outputs.repo }}
+          STATUS: ${{ steps.create.outputs.status }}
+        run: |
+          if [ "$STATUS" = "exists" ]; then
+            MSG="У вас уже есть репозиторий: https://github.com/$ORG/$REPO — приглашение отправлено повторно."
+          else
+            MSG="Готово! Ваш репозиторий: https://github.com/$ORG/$REPO"
+          fi
+          MSG="$MSG
+
+          Примите приглашение: https://github.com/$ORG/$REPO/invitations (или по ссылке из письма)."
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "$MSG"
+          gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY"
+
+      - name: Reply on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "Не получилось создать репозиторий. Преподаватели посмотрят и ответят здесь."
